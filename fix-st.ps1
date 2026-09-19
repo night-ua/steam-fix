@@ -96,13 +96,57 @@ function Invoke-Step {
 
 Clear-Host
 Write-Host ''
-Write-Host '██     ██ █████  ██████  ██    ██ █████████   ███████ █████ ██   ██' -ForegroundColor DarkYellow
-Write-Host '███    ██   ██ ██       ██    ██    ██   ██   ██  ██ ██' -ForegroundColor DarkYellow
-Write-Host '██ ██  ██   ██ ██  ███  ████████    ██   ██████    ██   ███' -ForegroundColor DarkYellow
-Write-Host '██  ██ ██   ██ ██    ██ ██    ██    ██   ██   ██  ██ ██' -ForegroundColor DarkYellow
-Write-Host '██     ██ █████  ██████  ██    ██    ██   ██   █████ ██   ██' -ForegroundColor DarkYellow
+
+# ---------------------------------------------------------------------
+# Banner :: build "NIGHT FIX" from fixed-width block glyphs so every
+# letter lines up on every row, then print it in true orange
+# (ANSI 24-bit). Falls back to DarkYellow when ANSI is unavailable.
+# ---------------------------------------------------------------------
+$script:AnsiEnabled = $false
+try {
+    $Native = Add-Type -Namespace 'Win32' -Name 'ConsoleMode' -PassThru -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+'@
+    $stdOut = $Native::GetStdHandle(-11)
+    $mode = [uint32]0
+    if ($Native::GetConsoleMode($stdOut, [ref]$mode) -and $Native::SetConsoleMode($stdOut, ($mode -bor 4))) {
+        $script:AnsiEnabled = $true
+    }
+} catch { }
+
+$Esc = [char]27
+$Orange = if ($script:AnsiEnabled) { "$Esc[38;2;255;165;0m" } else { '' }
+$Reset = if ($script:AnsiEnabled) { "$Esc[0m" } else { '' }
+
+$Glyphs = @{
+    N = @('██     ██', '███    ██', '██ ██  ██', '██  ██ ██', '██     ██')
+    I = @('█████', '  ██ ', '  ██ ', '  ██ ', '█████')
+    G = @(' ██████ ', '██      ', '██  ████', '██    ██', ' ██████ ')
+    H = @('██    ██', '██    ██', '████████', '██    ██', '██    ██')
+    T = @('█████████', '   ██    ', '   ██    ', '   ██    ', '   ██    ')
+    F = @('███████', '██     ', '██████ ', '██     ', '██     ')
+    X = @('██   ██', ' ██ ██ ', '  ███  ', ' ██ ██ ', '██   ██')
+}
+
+for ($row = 0; $row -lt 5; $row++) {
+    $left = ('NIGHT'.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '
+    $right = ('FIX'.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '
+    $line = "$left   $right"
+    if ($script:AnsiEnabled) {
+        Write-Host "$Orange$line$Reset"
+    } else {
+        Write-Host $line -ForegroundColor DarkYellow
+    }
+}
+
 Write-Host ''
-Write-Host '  night-fix  ::  installs the updated Steam fix files' -ForegroundColor DarkYellow
+if ($script:AnsiEnabled) {
+    Write-Host "$Orange  night-fix  ::  installs the updated Steam fix files$Reset"
+} else {
+    Write-Host '  night-fix  ::  installs the updated Steam fix files' -ForegroundColor DarkYellow
+}
 Write-Host '  https://github.com/night-ua/steam-fix' -ForegroundColor DarkGray
 Write-Host ''
 $UiRule = [string][char]0x2500 * 66
