@@ -1,217 +1,247 @@
+# =====================================================================
+#  night-fix :: fix-st.ps1
+#  Installs the updated Steam fix files automatically.
+#  Source of truth: https://github.com/night-ua/steam-fix
+# =====================================================================
+
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Windows PowerShell 5.1 may default to TLS 1.0, which the CDN rejects (handshake
-# closed mid-send). Force modern TLS so HttpWebRequest can negotiate with the server.
+# Windows PowerShell 5.1 may negotiate TLS 1.0 by default, which the CDN
+# rejects (handshake closed mid-send). Raise the floor so that every
+# request can complete against modern servers.
 try {
-    [System.Net.ServicePointManager]::SecurityProtocol = `
-        [System.Net.ServicePointManager]::SecurityProtocol `
-        -bor [System.Net.SecurityProtocolType]::Tls12 `
-        -bor [System.Net.SecurityProtocolType]::Tls13
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor
+        [System.Net.SecurityProtocolType]::Tls12 -bor
+        [System.Net.SecurityProtocolType]::Tls13
 } catch {
-    [System.Net.ServicePointManager]::SecurityProtocol = `
-        [System.Net.ServicePointManager]::SecurityProtocol `
-        -bor [System.Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor
+        [System.Net.SecurityProtocolType]::Tls12
 }
 
-function Show-SpinnerAndResult {
+# ---------------------------------------------------------------------
+# Runs one pipeline step behind a tiny spinner, then prints the outcome:
+#   ok   -> green check + step label (+ optional "Location:" line)
+#   fail -> red X + step label, the reason, then the script exits.
+# A step scriptblock must return one of:
+#   @{ Success = $true;  Path  = '<status text or file location>' }
+#   @{ Success = $false; Extra = '<failure reason>' }
+# ---------------------------------------------------------------------
+function Invoke-Step {
     param (
-        [string]$SpinnerText,
-        [ScriptBlock]$Action,
-        [string]$ExtraInfo = $null,
-        [string]$Tip = $null
+        [string]$Label,
+        [ScriptBlock]$Worker,
+        [string]$Location = $null,
+        [string]$Hint = $null
     )
-    $spinnerPos = [Console]::CursorTop
-    $spinner = @('|', '/', '-', '\')
-    Write-Host $spinner[0] -NoNewline -ForegroundColor White
-    Write-Host " $SpinnerText" -ForegroundColor White
-    if ($Tip) {
-        $tipPos = [Console]::CursorTop
-        Write-Host "  $([char]0x2514)$([char]0x2500) $Tip" -ForegroundColor Yellow
+    $topLine = [Console]::CursorTop
+    $frames = @('|', '/', '-', '\')
+    Write-Host $frames[0] -NoNewline -ForegroundColor White
+    Write-Host " $Label" -ForegroundColor White
+    if ($Hint) {
+        $hintLine = [Console]::CursorTop
+        Write-Host "  $([char]0x2514)$([char]0x2500) $Hint" -ForegroundColor Yellow
     }
-    $done = $false
-    $i = 0
-    $result = $null
-    $job = Start-Job -ScriptBlock $Action
+    $finished = $false
+    $tick = 0
+    $outcome = $null
+    $job = Start-Job -ScriptBlock $Worker
 
-    while (-not $done) {
+    while (-not $finished) {
         Start-Sleep -Milliseconds 100
-        $char = $spinner[$i % $spinner.Count]
-        [Console]::SetCursorPosition(0, $spinnerPos)
-        Write-Host $char -NoNewline -ForegroundColor White
-        Write-Host " $SpinnerText" -NoNewline -ForegroundColor White
-        $i++
-        if ($job.State -eq 'Completed' -or $job.State -eq 'Failed' -or $job.State -eq 'Stopped') {
-            $done = $true
+        $frame = $frames[$tick % $frames.Count]
+        [Console]::SetCursorPosition(0, $topLine)
+        Write-Host $frame -NoNewline -ForegroundColor White
+        Write-Host " $Label" -NoNewline -ForegroundColor White
+        $tick++
+        if ($job.State -in 'Completed', 'Failed', 'Stopped') {
+            $finished = $true
         }
     }
-    $result = Receive-Job $job -ErrorAction SilentlyContinue
+    $outcome = Receive-Job $job -ErrorAction SilentlyContinue
     Remove-Job $job | Out-Null
 
-    [Console]::SetCursorPosition(0, $spinnerPos)
-    [Console]::Write((' ' * ([Console]::WindowWidth-1)))
-    if ($Tip) {
-        [Console]::SetCursorPosition(0, $tipPos)
-        [Console]::Write((' ' * ([Console]::WindowWidth-1)))
+    [Console]::SetCursorPosition(0, $topLine)
+    [Console]::Write((' ' * ([Console]::WindowWidth - 1)))
+    if ($Hint) {
+        [Console]::SetCursorPosition(0, $hintLine)
+        [Console]::Write((' ' * ([Console]::WindowWidth - 1)))
     }
-    [Console]::SetCursorPosition(0, $spinnerPos)
-    if ($result -and $result.Success) {
+    [Console]::SetCursorPosition(0, $topLine)
+    if ($outcome -and $outcome.Success) {
         Write-Host ([char]0x2713) -NoNewline -ForegroundColor Green
-        Write-Host " $SpinnerText" -NoNewline -ForegroundColor Green
+        Write-Host " $Label" -NoNewline -ForegroundColor Green
         [Console]::WriteLine('')
-        if ($ExtraInfo) {
-            Write-Host "Location: $($result.Path)" -ForegroundColor White
+        if ($Location) {
+            Write-Host "Location: $($outcome.Path)" -ForegroundColor White
         }
     } else {
         Write-Host 'X' -NoNewline -ForegroundColor Red
-        Write-Host " $SpinnerText" -NoNewline -ForegroundColor Red
+        Write-Host " $Label" -NoNewline -ForegroundColor Red
         [Console]::WriteLine('')
-        if ($result -and $result.Extra) {
-            Write-Host "$($result.Extra)" -ForegroundColor Red
+        if ($outcome -and $outcome.Extra) {
+            Write-Host ''
+            Write-Host $UiRule -ForegroundColor DarkRed
+            Write-Host "  ERROR :: $($outcome.Extra)" -ForegroundColor Red
+            Write-Host $UiRule -ForegroundColor DarkRed
         }
         Write-Host ''
         Write-Host 'Press any key to exit...' -ForegroundColor White
         $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit
     }
-    return $result.Path
+    return $outcome.Path
 }
 
+Clear-Host
+Write-Host ''
+Write-Host '██     ██ █████  ██████  ██    ██ █████████   ███████ █████ ██   ██' -ForegroundColor DarkYellow
+Write-Host '███    ██   ██ ██       ██    ██    ██   ██   ██  ██ ██' -ForegroundColor DarkYellow
+Write-Host '██ ██  ██   ██ ██  ███  ████████    ██   ██████    ██   ███' -ForegroundColor DarkYellow
+Write-Host '██  ██ ██   ██ ██    ██ ██    ██    ██   ██   ██  ██ ██' -ForegroundColor DarkYellow
+Write-Host '██     ██ █████  ██████  ██    ██    ██   ██   █████ ██   ██' -ForegroundColor DarkYellow
+Write-Host ''
+Write-Host '  night-fix  ::  installs the updated Steam fix files' -ForegroundColor DarkYellow
+Write-Host '  https://github.com/night-ua/steam-fix' -ForegroundColor DarkGray
+Write-Host ''
+$UiRule = [string][char]0x2500 * 66
+Write-Host $UiRule -ForegroundColor DarkGray
+Write-Host ''
 
-# Step 0: Find Steam installation
-$steamPath = Show-SpinnerAndResult `
-    -SpinnerText 'Find Steam installation' `
-    -Action {
-        $registryPaths = @(
-            'HKCU:\Software\Valve\Steam',
-            'HKLM:\Software\Valve\Steam',
-            'HKLM:\Software\WOW6432Node\Valve\Steam'
-        )
-
-        foreach ($regPath in $registryPaths) {
-            if (Test-Path $regPath) {
-                $installPath = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).InstallPath
-                if ($installPath -and (Test-Path $installPath)) {
-                    return @{ Success = $true; Path = $installPath }
-                }
+# ---------------------------------------------------------------
+# Step 0 :: locate the Steam installation through the registry
+# ---------------------------------------------------------------
+$SteamPath = Invoke-Step -Label '[1/9] Locate Steam installation' -Worker {
+    foreach ($key in @(
+        'HKCU:\Software\Valve\Steam',
+        'HKLM:\Software\Valve\Steam',
+        'HKLM:\Software\WOW6432Node\Valve\Steam'
+    )) {
+        if (Test-Path $key) {
+            $installDir = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).InstallPath
+            if ($installDir -and (Test-Path $installDir)) {
+                return @{ Success = $true; Path = $installDir }
             }
         }
-
-        return @{ Success = $false; Extra = 'Steam installation not found. Try reinstalling Steam' }
     }
+    return @{ Success = $false; Extra = 'Steam installation not found. Try reinstalling Steam' }
+}
 
-# Step 1: Kill Steam processes
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Kill all Steam processes' `
-    -Action {
-        $steamProcesses = Get-Process | Where-Object { $_.Name -match 'steam' }
+# ---------------------------------------------------------------
+# Step 1 :: terminate every running Steam process
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[2/9] Stop Steam processes' -Worker {
+    $running = Get-Process | Where-Object { $_.Name -match 'steam' }
+    if (-not $running) { return @{ Success = $true; Path = '' } }
+    try {
+        $running | Stop-Process -Force -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        return @{ Success = $true; Path = '' }
+    } catch {
+        return @{ Success = $false; Extra = 'Could not terminate Steam processes. Run PowerShell as administrator and run the script again.' }
+    }
+}
 
-        if ($steamProcesses) {
-            try {
-                $steamProcesses | Stop-Process -Force -ErrorAction Stop
-                Start-Sleep -Seconds 2
-                return @{ Success = $true; Path = '' }
-            } catch {
-                return @{ Success = $false; Extra = "Could not terminate Steam processes. Run PowerShell as administrator and run the script again." }
+# ---------------------------------------------------------------
+# Step 2 :: delete the stale injector DLLs before replacing them
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[3/9] Delete stale DLL files' -Worker {
+    $sp = $using:SteamPath
+    try {
+        foreach ($name in @('xinput1_4.dll', 'dwmapi.dll')) {
+            $target = Join-Path $sp $name
+            if (Test-Path $target) { Remove-Item $target -Force -ErrorAction Stop }
+        }
+        return @{ Success = $true; Path = '' }
+    } catch {
+        return @{ Success = $false; Extra = "Could not delete files: $($_.Exception.Message)" }
+    }
+}
+
+# ---------------------------------------------------------------
+# Step 3 :: remove leftovers of the old SteamProof manifest fix
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[4/9] Remove SteamProof manifest fix' -Worker {
+    $sp = $using:SteamPath
+    $leftovers = @(
+        (Join-Path $sp 'wtsapi32.dll'),
+        (Join-Path $sp 'version.dll'),
+        (Join-Path $sp 'config\manifests.dll'),
+        (Join-Path $sp 'config\.mfx_init'),
+        (Join-Path $sp 'config\.stfix_init')
+    )
+    try {
+        $removed = 0
+        foreach ($leftover in $leftovers) {
+            if (Test-Path $leftover) {
+                Remove-Item $leftover -Force -ErrorAction Stop
+                $removed++
             }
-        } else {
-            return @{ Success = $true; Path = '' }
         }
+        return @{ Success = $true; Path = "$removed file(s) removed" }
+    } catch {
+        return @{ Success = $false; Extra = "Could not remove SteamProof manifest fix: $($_.Exception.Message)" }
     }
+}
 
-# Step 2: Delete existing xinput1_4.dll and dwmapi.dll
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Delete old files' `
-    -Action {
-        $dll1 = Join-Path $using:steamPath 'xinput1_4.dll'
-        $dll2 = Join-Path $using:steamPath 'dwmapi.dll'
+# ---------------------------------------------------------------------
+# Transfer HUD :: throttled spinner + progress bar shown during download.
+# ---------------------------------------------------------------------
+function Show-TransferHud {
+    param($Hud, $Title = '[5/9] Download updated files')
 
-        try {
-            if (Test-Path $dll1) { Remove-Item $dll1 -Force -ErrorAction Stop }
-            if (Test-Path $dll2) { Remove-Item $dll2 -Force -ErrorAction Stop }
-            return @{ Success = $true; Path = '' }
-        } catch {
-            return @{ Success = $false; Extra = "Could not delete files: $($_.Exception.Message)" }
-        }
-    }
+    $elapsed = $Hud.Clock.ElapsedMilliseconds
+    if (($elapsed - $Hud.LastFrameMs) -lt 100) { return }
+    $Hud.LastFrameMs = $elapsed
+    $Hud.Frame++
 
-# Step 3: Remove the SteamProof manifest fix
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Remove SteamProof manifest fix' `
-    -Action {
-        $sp = $using:steamPath
-        $targets = @(
-            (Join-Path $sp 'wtsapi32.dll'),
-            (Join-Path $sp 'version.dll'),
-            (Join-Path $sp 'config\manifests.dll'),
-            (Join-Path $sp 'config\.mfx_init'),
-            (Join-Path $sp 'config\.stfix_init')
-        )
+    $frame = $Hud.Frames[$Hud.Frame % $Hud.Frames.Count]
+    [Console]::SetCursorPosition(0, $Hud.TitlePos)
+    [Console]::Write("$frame $Title")
 
-        try {
-            $removed = 0
-            foreach ($t in $targets) {
-                if (Test-Path $t) {
-                    Remove-Item $t -Force -ErrorAction Stop
-                    $removed++
-                }
-            }
-            return @{ Success = $true; Path = "$removed file(s) removed" }
-        } catch {
-            return @{ Success = $false; Extra = "Could not remove SteamProof manifest fix: $($_.Exception.Message)" }
-        }
-    }
-
-function Update-DownloadDisplay {
-    param($Display)
-
-    $elapsed = $Display.Clock.ElapsedMilliseconds
-    if (($elapsed - $Display.LastFrameMs) -lt 100) { return }
-    $Display.LastFrameMs = $elapsed
-    $Display.Frame++
-
-    $char = $Display.Spinner[$Display.Frame % $Display.Spinner.Count]
-    [Console]::SetCursorPosition(0, $Display.TitlePos)
-    [Console]::Write("$char Download updated files")
-
-    if ($Display.TotalReady -and $Display.TotalBytes -gt 0) {
-        $progress = [math]::Min(1.0, ($Display.DownloadedBytes / $Display.TotalBytes))
-        $pct = [math]::Floor($progress * 100)
-        $filled = [math]::Floor($progress * $Display.BarLength)
-        $empty = $Display.BarLength - $filled
-        $bar = "$([char]0x2588)" * $filled + "$([char]0x2591)" * $empty
-        $sizeMB = '{0:N1}' -f ($Display.DownloadedBytes / 1MB)
-        $totalMB = '{0:N1}' -f ($Display.TotalBytes / 1MB)
-        $barText = "  $bar $pct% ($sizeMB / $totalMB MB)  "
-        [Console]::SetCursorPosition(0, $Display.BarPos)
+    if ($Hud.TotalReady -and $Hud.TotalBytes -gt 0) {
+        $ratio = [math]::Min(1.0, ($Hud.DoneBytes / $Hud.TotalBytes))
+        $pct = [math]::Floor($ratio * 100)
+        $filled = [math]::Floor($ratio * $Hud.BarLength)
+        $bar = ("$([char]0x2588)" * $filled) + ("$([char]0x2591)" * ($Hud.BarLength - $filled))
+        $doneMB = '{0:N1}' -f ($Hud.DoneBytes / 1MB)
+        $totalMB = '{0:N1}' -f ($Hud.TotalBytes / 1MB)
+        $barText = "  $bar $pct% ($doneMB / $totalMB MB)  "
+        [Console]::SetCursorPosition(0, $Hud.BarPos)
         [Console]::Write($barText)
     }
-
-    [Console]::SetCursorPosition(0, $Display.TitlePos)
+    [Console]::SetCursorPosition(0, $Hud.TitlePos)
 }
 
-function Wait-DownloadOperation {
+# ---------------------------------------------------------------------
+# Waits for one async I/O operation while keeping the HUD alive.
+# Aborts the request when the operation outlives its timeout.
+# ---------------------------------------------------------------------
+function Wait-Transfer {
     param(
         [IAsyncResult]$Operation,
-        $Display,
+        $Hud,
         [System.Net.HttpWebRequest]$Request,
         [int]$TimeoutMs
     )
-
-    $wait = [Diagnostics.Stopwatch]::StartNew()
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     while (-not $Operation.AsyncWaitHandle.WaitOne(100)) {
-        Update-DownloadDisplay $Display
-        if ($wait.ElapsedMilliseconds -ge $TimeoutMs) {
+        Show-TransferHud $Hud
+        if ($watch.ElapsedMilliseconds -ge $TimeoutMs) {
             $Request.Abort()
             throw 'The download request timed out.'
         }
     }
-    Update-DownloadDisplay $Display
+    Show-TransferHud $Hud
 }
 
-# Step 4: Download updated files
-$dllDownloadSuccess = $false
-$dllSpinner = @('|', '/', '-', '\')
-$dllNames = @(
+# ---------------------------------------------------------------
+# Step 4 :: download the updated fix files straight from the
+#           repository: https://github.com/night-ua/steam-fix
+# ---------------------------------------------------------------
+$RepoRawBase = 'https://raw.githubusercontent.com/night-ua/steam-fix/main/'
+$FixFileNames = @(
     'dwmapi.dll',
     'dwmapi.exp',
     'dwmapi.lib',
@@ -221,213 +251,219 @@ $dllNames = @(
     'xinput1_4.exp',
     'xinput1_4.lib'
 )
-$dllFiles = $dllNames | ForEach-Object { @{ Name = $_; Url = "https://raw.githubusercontent.com/night-ua/steam-fix/main/$_" } }
-$dllTitlePos = [Console]::CursorTop
-Write-Host "$($dllSpinner[0]) Download updated files" -ForegroundColor White
-$dllBarPos = [Console]::CursorTop
+$FixFiles = $FixFileNames | ForEach-Object { @{ Name = $_; Url = $RepoRawBase + $_ } }
+
+$frames = @('|', '/', '-', '\')
+$hudTop = [Console]::CursorTop
+Write-Host "$($frames[0]) [5/9] Download updated files" -ForegroundColor White
+$barTop = [Console]::CursorTop
 Write-Host ''
-$dllDisplay = @{
-    TitlePos = $dllTitlePos
-    BarPos = $dllBarPos
-    BarLength = 30
-    Spinner = $dllSpinner
-    Frame = 0
+$hud = @{
+    TitlePos    = $hudTop
+    BarPos      = $barTop
+    BarLength   = 30
+    Frames      = $frames
+    Frame       = 0
     LastFrameMs = -100
-    DownloadedBytes = 0L
-    TotalBytes = 0L
-    TotalReady = $false
-    Clock = [Diagnostics.Stopwatch]::StartNew()
+    DoneBytes   = 0L
+    TotalBytes  = 0L
+    TotalReady  = $false
+    Clock       = [Diagnostics.Stopwatch]::StartNew()
 }
+
+$downloadsOk = $false
+$headResp = $null
+$bodyResp = $null
+$body = $null
+$outFile = $null
+$item = $null
 
 try {
-    foreach ($dll in $dllFiles) {
-        $req = [System.Net.HttpWebRequest]::Create($dll.Url)
-        $req.Method = 'HEAD'
-        $headResult = $req.BeginGetResponse($null, $null)
-        Wait-DownloadOperation $headResult $dllDisplay $req $req.Timeout
-        $resp = $req.EndGetResponse($headResult)
-        if ($resp.ContentLength -gt 0) {
-            $dllDisplay.TotalBytes += $resp.ContentLength
+    # Pass 1 :: HEAD every file so the bar can show real totals.
+    foreach ($entry in $FixFiles) {
+        $request = [System.Net.HttpWebRequest]::Create($entry.Url)
+        $request.Method = 'HEAD'
+        $head = $request.BeginGetResponse($null, $null)
+        Wait-Transfer $head $hud $request $request.Timeout
+        $headResp = $request.EndGetResponse($head)
+        if ($headResp.ContentLength -gt 0) {
+            $hud.TotalBytes += $headResp.ContentLength
         }
-        $resp.Close()
-        $resp = $null
+        $headResp.Close()
+        $headResp = $null
     }
-    $dllDisplay.TotalReady = $true
+    $hud.TotalReady = $true
 
-    foreach ($dll in $dllFiles) {
-        $outPath = Join-Path $steamPath $dll.Name
-        $req = [System.Net.HttpWebRequest]::Create($dll.Url)
-        $responseResult = $req.BeginGetResponse($null, $null)
-        Wait-DownloadOperation $responseResult $dllDisplay $req $req.Timeout
-        $response = $req.EndGetResponse($responseResult)
-        $stream = $response.GetResponseStream()
-        $fileStream = [System.IO.File]::Create($outPath)
-        $buffer = New-Object byte[] 8192
+    # Pass 2 :: stream every file into the Steam directory.
+    foreach ($entry in $FixFiles) {
+        $item = $entry
+        $dest = Join-Path $SteamPath $entry.Name
+        $request = [System.Net.HttpWebRequest]::Create($entry.Url)
+        $async = $request.BeginGetResponse($null, $null)
+        Wait-Transfer $async $hud $request $request.Timeout
+        $bodyResp = $request.EndGetResponse($async)
+        $body = $bodyResp.GetResponseStream()
+        $outFile = [System.IO.File]::Create($dest)
+        $chunk = New-Object byte[] 8192
 
         while ($true) {
-            $readResult = $stream.BeginRead($buffer, 0, $buffer.Length, $null, $null)
-            Wait-DownloadOperation $readResult $dllDisplay $req $req.ReadWriteTimeout
-            $bytesRead = $stream.EndRead($readResult)
-            if ($bytesRead -eq 0) { break }
-
-            $fileStream.Write($buffer, 0, $bytesRead)
-            $dllDisplay.DownloadedBytes += $bytesRead
-            Update-DownloadDisplay $dllDisplay
+            $pending = $body.BeginRead($chunk, 0, $chunk.Length, $null, $null)
+            Wait-Transfer $pending $hud $request $request.ReadWriteTimeout
+            $read = $body.EndRead($pending)
+            if ($read -eq 0) { break }
+            $outFile.Write($chunk, 0, $read)
+            $hud.DoneBytes += $read
+            Show-TransferHud $hud
         }
 
-        $fileStream.Close()
-        $fileStream = $null
-        $stream.Close()
-        $stream = $null
-        $response.Close()
-        $response = $null
+        $outFile.Close();  $outFile = $null
+        $body.Close();     $body = $null
+        $bodyResp.Close(); $bodyResp = $null
     }
-    $dllDownloadSuccess = $true
+    $downloadsOk = $true
 } catch {
-    $dllError = $_
-    $failedFile = if ($dll) { $dll.Name } else { 'unknown' }
-    if ($resp) { $resp.Close() }
-    if ($fileStream) { $fileStream.Close() }
-    if ($stream) { $stream.Close() }
-    if ($response) { $response.Close() }
+    $downloadError = $_
+    $failedName = if ($item) { $item.Name } else { 'unknown' }
+    if ($headResp) { $headResp.Close() }
+    if ($outFile)  { $outFile.Close() }
+    if ($body)     { $body.Close() }
+    if ($bodyResp) { $bodyResp.Close() }
 }
 
-[Console]::SetCursorPosition(0, $dllTitlePos)
+[Console]::SetCursorPosition(0, $hudTop)
 [Console]::Write((' ' * ([Console]::WindowWidth - 1)))
-[Console]::SetCursorPosition(0, $dllBarPos)
+[Console]::SetCursorPosition(0, $barTop)
 [Console]::Write((' ' * ([Console]::WindowWidth - 1)))
-[Console]::SetCursorPosition(0, $dllTitlePos)
-if ($dllDownloadSuccess) {
+[Console]::SetCursorPosition(0, $hudTop)
+if ($downloadsOk) {
     Write-Host ([char]0x2713) -NoNewline -ForegroundColor Green
-    Write-Host ' Download updated files' -ForegroundColor Green
+    Write-Host ' [5/9] Download updated files' -ForegroundColor Green
 } else {
     Write-Host 'X' -NoNewline -ForegroundColor Red
-    Write-Host ' Download updated files' -ForegroundColor Red
-    $errMsg = "Failed to download $failedFile"
-    if ($dllError.Exception -is [System.Net.WebException] -and $dllError.Exception.Response) {
-        $statusCode = [int]$dllError.Exception.Response.StatusCode
-        $statusDesc = $dllError.Exception.Response.StatusDescription
-        $errMsg += " (HTTP $statusCode $statusDesc)"
-    } elseif ($dllError.Exception) {
-        $errMsg += ": $($dllError.Exception.Message)"
+    Write-Host ' [5/9] Download updated files' -ForegroundColor Red
+    $reason = "Failed to download $failedName"
+    if ($downloadError.Exception -is [System.Net.WebException] -and $downloadError.Exception.Response) {
+        $code = [int]$downloadError.Exception.Response.StatusCode
+        $desc = $downloadError.Exception.Response.StatusDescription
+        $reason += " (HTTP $code $desc)"
+    } elseif ($downloadError.Exception) {
+        $reason += ": $($downloadError.Exception.Message)"
     }
-    Write-Host $errMsg -ForegroundColor Red
+    Write-Host ''
+    Write-Host $UiRule -ForegroundColor DarkRed
+    Write-Host "  ERROR :: $reason" -ForegroundColor Red
+    Write-Host $UiRule -ForegroundColor DarkRed
     Write-Host ''
     Write-Host 'Press any key to exit...' -ForegroundColor White
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit
 }
 
-# Step 5: Configure GMRC source
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Configure GMRC source' `
-    -Action {
-        $configPath = Join-Path $using:steamPath 'opensteamtool.toml'
-
-        try {
-            $source = 'steamrun'
-            if (Test-Path -LiteralPath $configPath) {
-                $inManifest = $false
-                foreach ($line in [System.IO.File]::ReadAllLines($configPath)) {
-                    if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
-                        $inManifest = $Matches[1] -eq 'manifest'
-                        continue
-                    }
-                    if ($inManifest -and $line -match '^\s*url\s*=\s*"(steamrun|wudrm)"\s*(?:#.*)?$') {
-                        if ($Matches[1] -eq 'steamrun') { $source = 'wudrm' }
-                        break
-                    }
+# ---------------------------------------------------------------
+# Step 6 :: point opensteamtool.toml at the correct GMRC source.
+#           Flips steamrun -> wudrm when the old config used steamrun.
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[6/9] Configure GMRC source' -Worker {
+    $configFile = Join-Path $using:SteamPath 'opensteamtool.toml'
+    try {
+        $source = 'steamrun'
+        if (Test-Path -LiteralPath $configFile) {
+            $inManifest = $false
+            foreach ($line in [System.IO.File]::ReadAllLines($configFile)) {
+                if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
+                    $inManifest = $Matches[1] -eq 'manifest'
+                    continue
+                }
+                if ($inManifest -and $line -match '^\s*url\s*=\s*"(steamrun|wudrm)"\s*(?:#.*)?$') {
+                    if ($Matches[1] -eq 'steamrun') { $source = 'wudrm' }
+                    break
                 }
             }
+        }
+        [System.IO.File]::WriteAllText(
+            $configFile,
+            "[manifest]`r`nurl = `"$source`"`r`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        return @{ Success = $true; Path = $configFile }
+    } catch {
+        return @{ Success = $false; Extra = "Could not configure GMRC source: $($_.Exception.Message)" }
+    }
+}
 
-            [System.IO.File]::WriteAllText(
-                $configPath,
-                "[manifest]`r`nurl = `"$source`"`r`n",
-                [System.Text.UTF8Encoding]::new($false)
-            )
-            return @{ Success = $true; Path = $configPath }
-        } catch {
-            return @{ Success = $false; Extra = "Could not configure GMRC source: $($_.Exception.Message)" }
+# ---------------------------------------------------------------
+# Step 7 :: move existing lua plug-ins into config\lua
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[7/9] Move lua files' -Worker {
+    $sp = $using:SteamPath
+    $fromDir = Join-Path $sp 'config\stplug-in'
+    $toDir = Join-Path $sp 'config\lua'
+    try {
+        if (-not (Test-Path $toDir)) {
+            $null = New-Item -Path $toDir -ItemType Directory -Force -ErrorAction Stop
+        }
+        if (-not (Test-Path $fromDir)) { return @{ Success = $true; Path = '0 file(s) moved' } }
+        $moved = 0
+        foreach ($file in Get-ChildItem -Path $fromDir -Filter '*.lua' -ErrorAction SilentlyContinue) {
+            Move-Item -Path $file.FullName -Destination (Join-Path $toDir $file.Name) -Force -ErrorAction Stop
+            $moved++
+        }
+        return @{ Success = $true; Path = "$moved file(s) moved" }
+    } catch {
+        return @{ Success = $false; Extra = "Could not move lua files: $($_.Exception.Message)" }
+    }
+}
+
+# ---------------------------------------------------------------
+# Step 8 :: strip legacy SteamProof lines out of the lua files
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[8/9] Clean lua files' -Worker {
+    $luaDir = Join-Path $using:SteamPath 'config\lua'
+    if (-not (Test-Path $luaDir)) { return @{ Success = $true; Path = '' } }
+    $cleaned = 0
+    foreach ($file in Get-ChildItem -Path $luaDir -Filter '*.lua' -ErrorAction SilentlyContinue) {
+        $raw = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+        if ($raw -notmatch 'SteamProof') { continue }
+        $kept = Get-Content $file.FullName |
+            Where-Object { $_ -notmatch '^-- SteamProof' -and $_ -notmatch '^setManifestid' }
+        while ($kept.Count -gt 0 -and $kept[-1].Trim() -eq '') {
+            $kept = $kept[0..($kept.Count - 2)]
+        }
+        $kept | Set-Content $file.FullName -Encoding UTF8
+        $cleaned++
+    }
+    return @{ Success = $true; Path = "$cleaned file(s) cleaned" }
+}
+
+# ---------------------------------------------------------------
+# Step 9 :: remove the UTF-8 BOM that breaks lua parsing
+# ---------------------------------------------------------------
+$null = Invoke-Step -Label '[9/9] Fix lua files' -Worker {
+    $luaDir = Join-Path $using:SteamPath 'config\lua'
+    if (-not (Test-Path $luaDir)) { return @{ Success = $true; Path = '' } }
+    $bom = [byte[]]@(0xEF, 0xBB, 0xBF)
+    $fixed = 0
+    foreach ($file in Get-ChildItem -Path $luaDir -Filter '*.lua' -ErrorAction SilentlyContinue) {
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq $bom[0] -and $bytes[1] -eq $bom[1] -and $bytes[2] -eq $bom[2]) {
+            [System.IO.File]::WriteAllBytes($file.FullName, $bytes[3..($bytes.Length - 1)])
+            $fixed++
         }
     }
+    return @{ Success = $true; Path = "$fixed file(s) fixed" }
+}
 
-# Step 6: Move lua files to config\lua
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Move lua files' `
-    -Action {
-        $sp = $using:steamPath
-        $srcDir = Join-Path $sp "config\stplug-in"
-        $dstDir = Join-Path $sp "config\lua"
-
-        try {
-            if (-not (Test-Path $dstDir)) { $null = New-Item -Path $dstDir -ItemType Directory -Force -ErrorAction Stop }
-            if (-not (Test-Path $srcDir)) { return @{ Success = $true; Path = '0 file(s) moved' } }
-
-            $luaFiles = Get-ChildItem -Path $srcDir -Filter "*.lua" -ErrorAction SilentlyContinue
-            $moved = 0
-            foreach ($f in $luaFiles) {
-                Move-Item -Path $f.FullName -Destination (Join-Path $dstDir $f.Name) -Force -ErrorAction Stop
-                $moved++
-            }
-            return @{ Success = $true; Path = "$moved file(s) moved" }
-        } catch {
-            return @{ Success = $false; Extra = "Could not move lua files: $($_.Exception.Message)" }
-        }
-    }
-
-# Step 7: Remove legacy SteamProof lines from lua files
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Clean lua files' `
-    -Action {
-        $sp = $using:steamPath
-        $pDir = Join-Path $sp "config\lua"
-        if (-not (Test-Path $pDir)) { return @{ Success = $true; Path = '' } }
-
-        $luaFiles = Get-ChildItem -Path $pDir -Filter "*.lua" -ErrorAction SilentlyContinue
-        $cleaned = 0
-
-        foreach ($f in $luaFiles) {
-            $content = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
-            if ($content -match "SteamProof") {
-                $lines = Get-Content $f.FullName
-                $filtered = $lines | Where-Object { $_ -notmatch "^-- SteamProof" -and $_ -notmatch "^setManifestid" }
-                while ($filtered.Count -gt 0 -and $filtered[-1].Trim() -eq "") {
-                    $filtered = $filtered[0..($filtered.Count - 2)]
-                }
-                $filtered | Set-Content $f.FullName -Encoding UTF8
-                $cleaned++
-            }
-        }
-
-        return @{ Success = $true; Path = "$cleaned file(s) cleaned" }
-    }
-
-# Step 8: Remove UTF-8 BOM from lua files
-$null = Show-SpinnerAndResult `
-    -SpinnerText 'Fix lua files' `
-    -Action {
-        $sp = $using:steamPath
-        $pDir = Join-Path $sp "config\lua"
-        if (-not (Test-Path $pDir)) { return @{ Success = $true; Path = '' } }
-        $luaFiles = Get-ChildItem -Path $pDir -Filter "*.lua" -EA SilentlyContinue
-        $fixed = 0
-        $bom = [byte[]]@(0xEF, 0xBB, 0xBF)
-        foreach ($f in $luaFiles) {
-            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-            if ($bytes.Length -ge 3 -and $bytes[0] -eq $bom[0] -and $bytes[1] -eq $bom[1] -and $bytes[2] -eq $bom[2]) {
-                [System.IO.File]::WriteAllBytes($f.FullName, $bytes[3..($bytes.Length - 1)])
-                $fixed++
-            }
-        }
-        return @{ Success = $true; Path = "$fixed file(s) fixed" }
-    }
-
+# ---------------------------------------------------------------------
+# Done :: final instructions for the user.
+# ---------------------------------------------------------------------
 Write-Host ''
-Write-Host ([char]0x2713) 'Process completed' -BackgroundColor Green -ForegroundColor Black
+Write-Host $UiRule -ForegroundColor Green
+Write-Host " $([char]0x2713) Process completed -- all steps finished" -ForegroundColor Green
+Write-Host $UiRule -ForegroundColor Green
 Write-Host ''
 Write-Host 'To add games or apps:' -ForegroundColor Yellow
 Write-Host 'Move each downloaded .lua file into this folder:' -ForegroundColor White
-Write-Host "  $(Join-Path $steamPath 'config\lua')" -ForegroundColor White
+Write-Host "  $(Join-Path $SteamPath 'config\lua')" -ForegroundColor White
 Write-Host 'Dragging files onto the floating Steam icon no longer works.' -ForegroundColor White
 Write-Host 'Steam picks up files in that folder right away. No restart is needed.' -ForegroundColor White
 Write-Host ''
