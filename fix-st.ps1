@@ -1,5 +1,7 @@
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Windows PowerShell 5.1 may default to TLS 1.0, which the CDN rejects (handshake
+# closed mid-send). Force modern TLS so HttpWebRequest can negotiate with the server.
 try {
     [System.Net.ServicePointManager]::SecurityProtocol = `
         [System.Net.ServicePointManager]::SecurityProtocol `
@@ -74,6 +76,8 @@ function Show-SpinnerAndResult {
     return $result.Path
 }
 
+
+# Step 0: Find Steam installation
 $steamPath = Show-SpinnerAndResult `
     -SpinnerText 'Find Steam installation' `
     -Action {
@@ -95,6 +99,7 @@ $steamPath = Show-SpinnerAndResult `
         return @{ Success = $false; Extra = 'Steam installation not found. Try reinstalling Steam' }
     }
 
+# Step 1: Kill Steam processes
 $null = Show-SpinnerAndResult `
     -SpinnerText 'Kill all Steam processes' `
     -Action {
@@ -113,6 +118,7 @@ $null = Show-SpinnerAndResult `
         }
     }
 
+# Step 2: Delete existing xinput1_4.dll and dwmapi.dll
 $null = Show-SpinnerAndResult `
     -SpinnerText 'Delete old files' `
     -Action {
@@ -128,6 +134,7 @@ $null = Show-SpinnerAndResult `
         }
     }
 
+# Step 3: Remove the SteamProof manifest fix
 $null = Show-SpinnerAndResult `
     -SpinnerText 'Remove SteamProof manifest fix' `
     -Action {
@@ -154,10 +161,56 @@ $null = Show-SpinnerAndResult `
         }
     }
 
+function Update-DownloadDisplay {
+    param($Display)
+
+    $elapsed = $Display.Clock.ElapsedMilliseconds
+    if (($elapsed - $Display.LastFrameMs) -lt 100) { return }
+    $Display.LastFrameMs = $elapsed
+    $Display.Frame++
+
+    $char = $Display.Spinner[$Display.Frame % $Display.Spinner.Count]
+    [Console]::SetCursorPosition(0, $Display.TitlePos)
+    [Console]::Write("$char Download updated files")
+
+    if ($Display.TotalReady -and $Display.TotalBytes -gt 0) {
+        $progress = [math]::Min(1.0, ($Display.DownloadedBytes / $Display.TotalBytes))
+        $pct = [math]::Floor($progress * 100)
+        $filled = [math]::Floor($progress * $Display.BarLength)
+        $empty = $Display.BarLength - $filled
+        $bar = "$([char]0x2588)" * $filled + "$([char]0x2591)" * $empty
+        $sizeMB = '{0:N1}' -f ($Display.DownloadedBytes / 1MB)
+        $totalMB = '{0:N1}' -f ($Display.TotalBytes / 1MB)
+        $barText = "  $bar $pct% ($sizeMB / $totalMB MB)  "
+        [Console]::SetCursorPosition(0, $Display.BarPos)
+        [Console]::Write($barText)
+    }
+
+    [Console]::SetCursorPosition(0, $Display.TitlePos)
+}
+
+function Wait-DownloadOperation {
+    param(
+        [IAsyncResult]$Operation,
+        $Display,
+        [System.Net.HttpWebRequest]$Request,
+        [int]$TimeoutMs
+    )
+
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $Operation.AsyncWaitHandle.WaitOne(100)) {
+        Update-DownloadDisplay $Display
+        if ($wait.ElapsedMilliseconds -ge $TimeoutMs) {
+            $Request.Abort()
+            throw 'The download request timed out.'
+        }
+    }
+    Update-DownloadDisplay $Display
+}
+
+# Step 4: Download updated files
 $dllDownloadSuccess = $false
-$dllBarLength = 30
 $dllSpinner = @('|', '/', '-', '\')
-$dllSpinnerIdx = 0
 $dllNames = @(
     'dwmapi.dll',
     'dwmapi.exp',
@@ -169,62 +222,71 @@ $dllNames = @(
     'xinput1_4.lib'
 )
 $dllFiles = $dllNames | ForEach-Object { @{ Name = $_; Url = "https://raw.githubusercontent.com/night-ua/steam-fix/main/$_" } }
-$dllTotalDownloaded = 0
-$dllTotalBytes = 0
-
 $dllTitlePos = [Console]::CursorTop
 Write-Host "$($dllSpinner[0]) Download updated files" -ForegroundColor White
 $dllBarPos = [Console]::CursorTop
 Write-Host ''
+$dllDisplay = @{
+    TitlePos = $dllTitlePos
+    BarPos = $dllBarPos
+    BarLength = 30
+    Spinner = $dllSpinner
+    Frame = 0
+    LastFrameMs = -100
+    DownloadedBytes = 0L
+    TotalBytes = 0L
+    TotalReady = $false
+    Clock = [Diagnostics.Stopwatch]::StartNew()
+}
 
 try {
     foreach ($dll in $dllFiles) {
         $req = [System.Net.HttpWebRequest]::Create($dll.Url)
         $req.Method = 'HEAD'
-        $resp = $req.GetResponse()
-        $dllTotalBytes += $resp.ContentLength
+        $headResult = $req.BeginGetResponse($null, $null)
+        Wait-DownloadOperation $headResult $dllDisplay $req $req.Timeout
+        $resp = $req.EndGetResponse($headResult)
+        if ($resp.ContentLength -gt 0) {
+            $dllDisplay.TotalBytes += $resp.ContentLength
+        }
         $resp.Close()
+        $resp = $null
     }
+    $dllDisplay.TotalReady = $true
 
     foreach ($dll in $dllFiles) {
         $outPath = Join-Path $steamPath $dll.Name
-        $response = [System.Net.HttpWebRequest]::Create($dll.Url).GetResponse()
+        $req = [System.Net.HttpWebRequest]::Create($dll.Url)
+        $responseResult = $req.BeginGetResponse($null, $null)
+        Wait-DownloadOperation $responseResult $dllDisplay $req $req.Timeout
+        $response = $req.EndGetResponse($responseResult)
         $stream = $response.GetResponseStream()
         $fileStream = [System.IO.File]::Create($outPath)
         $buffer = New-Object byte[] 8192
 
-        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        while ($true) {
+            $readResult = $stream.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+            Wait-DownloadOperation $readResult $dllDisplay $req $req.ReadWriteTimeout
+            $bytesRead = $stream.EndRead($readResult)
+            if ($bytesRead -eq 0) { break }
+
             $fileStream.Write($buffer, 0, $bytesRead)
-            $dllTotalDownloaded += $bytesRead
-            $dllSpinnerIdx++
-
-            $char = $dllSpinner[$dllSpinnerIdx % $dllSpinner.Count]
-            [Console]::SetCursorPosition(0, $dllTitlePos)
-            [Console]::Write("$char Download updated files")
-
-            if ($dllTotalBytes -gt 0) {
-                $pct = [math]::Floor(($dllTotalDownloaded / $dllTotalBytes) * 100)
-                $filled = [math]::Floor(($dllTotalDownloaded / $dllTotalBytes) * $dllBarLength)
-                $empty = $dllBarLength - $filled
-                $bar = "$([char]0x2588)" * $filled + "$([char]0x2591)" * $empty
-                $sizeMB = '{0:N1}' -f ($dllTotalDownloaded / 1MB)
-                $totalMB = '{0:N1}' -f ($dllTotalBytes / 1MB)
-                $barText = "  $bar $pct% ($sizeMB / $totalMB MB)  "
-                [Console]::SetCursorPosition(0, $dllBarPos)
-                [Console]::Write($barText)
-            }
-
-            [Console]::SetCursorPosition(0, $dllTitlePos)
+            $dllDisplay.DownloadedBytes += $bytesRead
+            Update-DownloadDisplay $dllDisplay
         }
 
         $fileStream.Close()
+        $fileStream = $null
         $stream.Close()
+        $stream = $null
         $response.Close()
+        $response = $null
     }
     $dllDownloadSuccess = $true
 } catch {
     $dllError = $_
     $failedFile = if ($dll) { $dll.Name } else { 'unknown' }
+    if ($resp) { $resp.Close() }
     if ($fileStream) { $fileStream.Close() }
     if ($stream) { $stream.Close() }
     if ($response) { $response.Close() }
@@ -256,6 +318,40 @@ if ($dllDownloadSuccess) {
     exit
 }
 
+# Step 5: Configure GMRC source
+$null = Show-SpinnerAndResult `
+    -SpinnerText 'Configure GMRC source' `
+    -Action {
+        $configPath = Join-Path $using:steamPath 'opensteamtool.toml'
+
+        try {
+            $source = 'steamrun'
+            if (Test-Path -LiteralPath $configPath) {
+                $inManifest = $false
+                foreach ($line in [System.IO.File]::ReadAllLines($configPath)) {
+                    if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
+                        $inManifest = $Matches[1] -eq 'manifest'
+                        continue
+                    }
+                    if ($inManifest -and $line -match '^\s*url\s*=\s*"(steamrun|wudrm)"\s*(?:#.*)?$') {
+                        if ($Matches[1] -eq 'steamrun') { $source = 'wudrm' }
+                        break
+                    }
+                }
+            }
+
+            [System.IO.File]::WriteAllText(
+                $configPath,
+                "[manifest]`r`nurl = `"$source`"`r`n",
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            return @{ Success = $true; Path = $configPath }
+        } catch {
+            return @{ Success = $false; Extra = "Could not configure GMRC source: $($_.Exception.Message)" }
+        }
+    }
+
+# Step 6: Move lua files to config\lua
 $null = Show-SpinnerAndResult `
     -SpinnerText 'Move lua files' `
     -Action {
@@ -279,6 +375,7 @@ $null = Show-SpinnerAndResult `
         }
     }
 
+# Step 7: Remove legacy SteamProof lines from lua files
 $null = Show-SpinnerAndResult `
     -SpinnerText 'Clean lua files' `
     -Action {
@@ -305,6 +402,7 @@ $null = Show-SpinnerAndResult `
         return @{ Success = $true; Path = "$cleaned file(s) cleaned" }
     }
 
+# Step 8: Remove UTF-8 BOM from lua files
 $null = Show-SpinnerAndResult `
     -SpinnerText 'Fix lua files' `
     -Action {
@@ -326,6 +424,21 @@ $null = Show-SpinnerAndResult `
 
 Write-Host ''
 Write-Host ([char]0x2713) 'Process completed' -BackgroundColor Green -ForegroundColor Black
+Write-Host ''
+Write-Host 'To add games or apps:' -ForegroundColor Yellow
+Write-Host 'Move each downloaded .lua file into this folder:' -ForegroundColor White
+Write-Host "  $(Join-Path $steamPath 'config\lua')" -ForegroundColor White
+Write-Host 'Dragging files onto the floating Steam icon no longer works.' -ForegroundColor White
+Write-Host 'Steam picks up files in that folder right away. No restart is needed.' -ForegroundColor White
+Write-Host ''
+Write-Host 'Open Steam normally and retry the download or update.' -ForegroundColor Yellow
+Write-Host 'If Steam shows NO INTERNET CONNECTION or UNKNOWN ERROR:' -ForegroundColor Yellow
+Write-Host '  1. Right-click the Steam icon in the system tray and choose Exit Steam.' -ForegroundColor White
+Write-Host '     Open Steam normally and retry.' -ForegroundColor White
+Write-Host '  2. If it still fails, run this script again.' -ForegroundColor White
+Write-Host '     Open Steam normally and retry.' -ForegroundColor White
+Write-Host '  3. If it still fails, exit Steam from the tray and open it normally again.' -ForegroundColor White
+Write-Host '     Retry the download or update.' -ForegroundColor White
 Write-Host ''
 Write-Host 'Press any key to exit...' -ForegroundColor DarkGray
 $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
