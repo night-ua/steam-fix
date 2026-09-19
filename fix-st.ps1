@@ -102,23 +102,67 @@ Write-Host ''
 # letter lines up on every row, then print it in true orange
 # (ANSI 24-bit). Falls back to DarkYellow when ANSI is unavailable.
 # ---------------------------------------------------------------------
-$script:AnsiEnabled = $false
+$script:OrangeMode = 'fallback'   # ansi | palette | fallback
+$Esc = [char]27
+$OrangeCode = "$Esc[38;2;255;165;0m"
+$ResetCode = "$Esc[0m"
 try {
-    $Native = Add-Type -Namespace 'Win32' -Name 'ConsoleMode' -PassThru -MemberDefinition @'
+    Add-Type -Namespace 'Win32' -Name 'ConsoleFx' -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int nStdHandle);
 [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
 [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+[StructLayout(LayoutKind.Sequential)]
+public struct COORD { public short X; public short Y; }
+[StructLayout(LayoutKind.Sequential)]
+public struct SMALL_RECT { public short Left; public short Top; public short Right; public short Bottom; }
+[StructLayout(LayoutKind.Sequential)]
+public struct CONSOLE_SCREEN_BUFFER_INFOEX
+{
+    public uint cbSize;
+    public COORD dwSize;
+    public COORD dwCursorPosition;
+    public ushort wAttributes;
+    public SMALL_RECT srWindow;
+    public COORD dwMaximumWindowSize;
+    public ushort wPopupAttributes;
+    [MarshalAs(UnmanagedType.Bool)] public bool bFullscreenSupported;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public uint[] ColorTable;
+}
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleScreenBufferInfoEx(System.IntPtr h, ref CONSOLE_SCREEN_BUFFER_INFOEX info);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleScreenBufferInfoEx(System.IntPtr h, ref CONSOLE_SCREEN_BUFFER_INFOEX info);
 '@
+    $Native = [Win32.ConsoleFx]
     $stdOut = $Native::GetStdHandle(-11)
     $mode = [uint32]0
-    if ($Native::GetConsoleMode($stdOut, [ref]$mode) -and $Native::SetConsoleMode($stdOut, ($mode -bor 4))) {
-        $script:AnsiEnabled = $true
+    $vtOn = $Native::GetConsoleMode($stdOut, [ref]$mode) -and $Native::SetConsoleMode($stdOut, ($mode -bor 4))
+
+    if ($env:WT_SESSION -and $vtOn) {
+        # Windows Terminal renders 24-bit ANSI colours natively.
+        $script:OrangeMode = 'ansi'
+    } else {
+        # The classic console quantises ANSI colours to its 16-entry
+        # palette, so repaint the DarkYellow slot with real orange.
+        $info = New-Object 'Win32.ConsoleFx+CONSOLE_SCREEN_BUFFER_INFOEX'
+        $info.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([type]'Win32.ConsoleFx+CONSOLE_SCREEN_BUFFER_INFOEX')
+        $info.ColorTable = [uint32[]]::new(16)
+        if ($vtOn -and $Native::GetConsoleScreenBufferInfoEx($stdOut, [ref]$info)) {
+            $info.ColorTable[6] = [uint32]0x0000A5FF   # COLORREF 0x00bbggrr -> #FFA500
+            if ($Native::SetConsoleScreenBufferInfoEx($stdOut, [ref]$info)) {
+                $script:OrangeMode = 'palette'
+            }
+        }
     }
 } catch { }
 
-$Esc = [char]27
-$Orange = if ($script:AnsiEnabled) { "$Esc[38;2;255;165;0m" } else { '' }
-$Reset = if ($script:AnsiEnabled) { "$Esc[0m" } else { '' }
+# Prints text in real orange on every console flavour.
+function Write-Orange {
+    param([string]$Text)
+    if ($script:OrangeMode -eq 'ansi') {
+        Write-Host "$OrangeCode$Text$ResetCode"
+    } else {
+        Write-Host $Text -ForegroundColor DarkYellow
+    }
+}
 
 $Glyphs = @{
     N = @('██     ██', '███    ██', '██ ██  ██', '██  ██ ██', '██     ██')
@@ -130,23 +174,37 @@ $Glyphs = @{
     X = @('██   ██', ' ██ ██ ', '  ███  ', ' ██ ██ ', '██   ██')
 }
 
-for ($row = 0; $row -lt 5; $row++) {
-    $left = ('NIGHT'.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '
-    $right = ('FIX'.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '
-    $line = "$left   $right"
-    if ($script:AnsiEnabled) {
-        Write-Host "$Orange$line$Reset"
-    } else {
-        Write-Host $line -ForegroundColor DarkYellow
+$WindowCols = 80
+try { $WindowCols = [Console]::WindowWidth } catch { }
+
+# Draws one word of the banner, one glyph row at a time.
+function Show-WordBanner {
+    param([string]$Word)
+    for ($row = 0; $row -lt 5; $row++) {
+        Write-Orange ((($Word.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '))
     }
 }
 
 Write-Host ''
-if ($script:AnsiEnabled) {
-    Write-Host "$Orange  night-fix  ::  installs the updated Steam fix files$Reset"
+if ($WindowCols -ge 70) {
+    # Wide console: "NIGHT FIX" on one line per glyph row.
+    for ($row = 0; $row -lt 5; $row++) {
+        $left = ('NIGHT'.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '
+        $right = ('FIX'.ToCharArray() | ForEach-Object { $Glyphs[[string]$_][$row] }) -join ' '
+        Write-Orange "$left   $right"
+    }
+} elseif ($WindowCols -ge 46) {
+    # Narrow console: stack the words so nothing wraps.
+    Show-WordBanner 'NIGHT'
+    Write-Host ''
+    Show-WordBanner 'FIX'
 } else {
-    Write-Host '  night-fix  ::  installs the updated Steam fix files' -ForegroundColor DarkYellow
+    # Too narrow for block letters at all.
+    Write-Orange 'night-fix'
 }
+
+Write-Host ''
+Write-Orange '  night-fix  ::  installs the updated Steam fix files'
 Write-Host '  https://github.com/night-ua/steam-fix' -ForegroundColor DarkGray
 Write-Host ''
 $UiRule = [string][char]0x2500 * 66
